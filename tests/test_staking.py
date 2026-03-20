@@ -1,5 +1,5 @@
 import pytest
-from brownie import BBSStaking, Erc20, MockAave, accounts, reverts
+from brownie import BBSStaking, Erc20, MockAave, MockAToken, accounts, reverts, web3
 
 # Fixtures provide setup for each test
 @pytest.fixture
@@ -13,8 +13,12 @@ def mock_aave(MockAave, accounts):
     return MockAave.deploy({'from': accounts[0]})
 
 @pytest.fixture
+def mock_atoken(MockAToken, mock_usdc, accounts):
+    return MockAToken.deploy(mock_usdc.address, {'from': accounts[0]})
+
+@pytest.fixture
 def staking_contract(BBSStaking, mock_usdc, mock_aave, accounts):
-    # Constructor: _erc20, _aave (now only 2 parameters)
+    # Constructor: _erc20, _aave
     return BBSStaking.deploy(
         mock_usdc.address, 
         mock_aave.address, 
@@ -133,3 +137,42 @@ def test_change_owner(staking_contract, accounts):
     # 原所有者不能再修改
     with reverts():
         staking_contract.setMinDeposit(100, {'from': accounts[0]})
+
+def test_set_atoken_and_withdraw_profit(mock_aave, mock_atoken, mock_usdc, staking_contract, accounts):
+    # 设置 aToken 映射
+    mock_aave.setAToken(mock_usdc.address, mock_atoken.address, {'from': accounts[0]})
+    assert mock_aave.getReserveAToken(mock_usdc.address) == mock_atoken.address
+
+def test_withdraw_profit_with_gain(mock_aave, mock_atoken, mock_usdc, staking_contract, accounts):
+    mock_aave.setAToken(mock_usdc.address, mock_atoken.address, {'from': accounts[0]})
+    
+    user = accounts[1]
+    amount = 1000 * 10**6
+    
+    mock_usdc.transfer(user, amount, {'from': accounts[0]})
+    mock_usdc.approve(staking_contract.address, amount, {'from': user})
+    staking_contract.deposit(amount, {'from': user})
+    
+    # 等待多个区块产生收益 (每 block 0.1%)
+    for _ in range(10):
+        mock_aave.setAToken(mock_usdc.address, mock_atoken.address, {'from': accounts[0]})
+    
+    # 检查 aToken 余额增长
+    aToken_balance = mock_atoken.balanceOf(staking_contract.address)
+    assert aToken_balance > amount
+    
+    # 提取收益 (aToken)
+    owner = accounts[0]
+    owner_atoken_initial_balance = mock_atoken.balanceOf(owner)
+    staking_contract.withdrawProfit({'from': owner})
+    
+    # 验证 owner 收到了 aToken 收益
+    owner_atoken_final_balance = mock_atoken.balanceOf(owner)
+    assert owner_atoken_final_balance > owner_atoken_initial_balance
+
+def test_withdraw_profit_only_owner(mock_aave, mock_atoken, mock_usdc, staking_contract, accounts):
+    mock_aave.setAToken(mock_usdc.address, mock_atoken.address, {'from': accounts[0]})
+    
+    # 非 owner 不能提取收益
+    with reverts():
+        staking_contract.withdrawProfit({'from': accounts[1]})

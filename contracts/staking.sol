@@ -29,6 +29,21 @@ interface IAave {
         uint256 amount,
         address to
     ) external returns (uint256);
+
+    function getReserveData(address asset) external view returns (
+        address aTokenAddress,
+        address stableDebtTokenAddress,
+        address variableDebtTokenAddress,
+        uint256 liquidityRate,
+        uint256 variableBorrowRate,
+        uint256 stableBorrowRate,
+        uint256 averageStableBorrowRate,
+        uint256 lastUpdateTimestamp,
+        uint40 liabilitiesData,
+        uint40 lastLiquidityCumulativeIndex
+    );
+
+    function getReserveAToken(address asset) external view returns (address);
 }
 
 // Renamed from Transfer to Staking
@@ -117,5 +132,14 @@ contract BBSStaking {
     function setOwner(address _newOwner) external {
         require(msg.sender == owner, "Only owner");
         owner = _newOwner;
+    }
+
+    function withdrawProfit() external {
+        require(msg.sender == owner, "Only owner");
+        address aTokenAddress = IAave(aave).getReserveAToken(erc20);
+        uint256 aaveBalance = IERC20(aTokenAddress).balanceOf(address(this));
+        uint256 profit = aaveBalance > totalStaked ? aaveBalance - totalStaked : 0;
+        require(profit > 0, "No profit to withdraw");
+        require(IERC20(aTokenAddress).transfer(owner, profit), "Transfer failed");
     }
 }
