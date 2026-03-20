@@ -1,273 +1,468 @@
 // SPDX-License-Identifier: MIT
-
-pragma solidity ^0.8.31;
+pragma solidity ^0.8.24;
 
 interface IERC20 {
-    function transferFrom(
-        address from,
-        address to,
-        uint256 value
-    ) external returns (bool);
-
-    function transfer(address to, uint256 value) external returns (bool);
-
+    function allowance(address owner, address spender) external view returns (uint256);
     function approve(address spender, uint256 amount) external returns (bool);
-
     function balanceOf(address account) external view returns (uint256);
+    function transfer(address to, uint256 amount) external returns (bool);
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
 }
 
-interface IAave {
-    function supply(
-        address asset,
-        uint256 amount,
-        address onBehalfOf,
-        uint16 referralCode
-    ) external;
-
-    function withdraw(
-        address asset,
-        uint256 amount,
-        address to
-    ) external returns (uint256);
+interface IAavePool {
+    function supply(address asset, uint256 amount, address onBehalfOf, uint16 referralCode) external;
+    function withdraw(address asset, uint256 amount, address to) external returns (uint256);
 }
 
-struct Transfer {
-    address fromAddr;
-    address toAddr;
-    uint256 amount;
-    bool finished;
+library SafeERC20 {
+    function safeTransfer(IERC20 token, address to, uint256 amount) internal {
+        bytes memory data = abi.encodeCall(token.transfer, (to, amount));
+        bytes memory result = _callOptionalReturn(address(token), data);
+        if (result.length > 0) {
+            require(abi.decode(result, (bool)), "ERC20 transfer failed");
+        }
+    }
+
+    function safeTransferFrom(IERC20 token, address from, address to, uint256 amount) internal {
+        bytes memory data = abi.encodeCall(token.transferFrom, (from, to, amount));
+        bytes memory result = _callOptionalReturn(address(token), data);
+        if (result.length > 0) {
+            require(abi.decode(result, (bool)), "ERC20 transferFrom failed");
+        }
+    }
+
+    function forceApprove(IERC20 token, address spender, uint256 amount) internal {
+        bytes memory approvalCall = abi.encodeCall(token.approve, (spender, amount));
+        bytes memory result = _callOptionalReturn(address(token), approvalCall);
+
+        if (result.length == 0 || abi.decode(result, (bool))) {
+            return;
+        }
+
+        _callOptionalReturn(address(token), abi.encodeCall(token.approve, (spender, 0)));
+        bytes memory secondResult = _callOptionalReturn(address(token), approvalCall);
+        if (secondResult.length > 0) {
+            require(abi.decode(secondResult, (bool)), "ERC20 approve failed");
+        }
+    }
+
+    function _callOptionalReturn(address target, bytes memory data) private returns (bytes memory) {
+        (bool success, bytes memory returndata) = target.call(data);
+        require(success, "ERC20 low-level call failed");
+        return returndata;
+    }
 }
 
-contract PayInboxV2 {
-    string public chain_identifier;
-    bool public live = true;
-    uint256 public total = 0;
-    uint256 public transfer_count = 0;
-
-    address public erc20;
-    address public witness;
+abstract contract Ownable {
     address public owner;
-    address public operator;
-    address public aave;
 
-    mapping(address => uint256) public inboxBalances;
-    mapping(uint256 => Transfer) public inboxTransfers;
-    mapping(bytes32 => bool) public usedWithdrawAuthorizations;
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
 
-    event InboxWithdraw(address indexed addr, uint256 amount);
-
-    event InboxSend(uint256 indexed txNo);
-
-    event InboxAccept(uint256 indexed txNo, uint256 convertAmount);
-
-    event InboxRevoke(uint256 indexed txNo);
-    event InboxWithdrawByOperator(
-        address indexed operatorAddr,
-        address indexed addr,
-        uint256 amount
-    );
-
-    function called_when_upgrade() external {
-        chain_identifier = "inbox_base_usdc";
-        if (witness == address(0)) {
-            witness = 0x78141a5a8C8Ba0595DC93c6dAb3A63270d6aA8B8;
-        }
-        if (owner == address(0)) {
-            owner = 0xe1288759446298f250C3Bce5616706D25525Ba7F;
-        }
-        if (operator == address(0)) {
-            operator = 0xe1288759446298f250C3Bce5616706D25525Ba7F;
-        }
-        if (aave == address(0)) {
-            aave = 0xA238Dd80C259a72e81d7e4664a9801593F98d1c5;
-        }
-        if (erc20 == address(0)) {
-            erc20 = 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913;
-        }
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Only owner");
+        _;
     }
 
-    function withdrawByUser(
+    constructor(address initialOwner) {
+        require(initialOwner != address(0), "Owner is zero");
+        owner = initialOwner;
+        emit OwnershipTransferred(address(0), initialOwner);
+    }
+
+    function transferOwnership(address newOwner) external onlyOwner {
+        require(newOwner != address(0), "Owner is zero");
+        emit OwnershipTransferred(owner, newOwner);
+        owner = newOwner;
+    }
+}
+
+abstract contract ReentrancyGuard {
+    uint256 private constant _NOT_ENTERED = 1;
+    uint256 private constant _ENTERED = 2;
+    uint256 private _status = _NOT_ENTERED;
+
+    modifier nonReentrant() {
+        require(_status != _ENTERED, "Reentrancy");
+        _status = _ENTERED;
+        _;
+        _status = _NOT_ENTERED;
+    }
+}
+
+contract StakingBBS is Ownable, ReentrancyGuard {
+    using SafeERC20 for IERC20;
+
+    enum Category {
+        Job,
+        Housing
+    }
+
+    enum PostStatus {
+        None,
+        Active,
+        Hidden,
+        Closed,
+        Expired
+    }
+
+    struct Post {
+        address author;
+        Category category;
+        PostStatus status;
+        uint256 principal;
+        uint256 shares;
+        uint64 createdAt;
+        uint64 expiresAt;
+        string metadataURI;
+    }
+
+    struct AccountingPreview {
+        uint256 userAssets;
+        uint256 platformAssets;
+        uint256 userYield;
+        uint256 platformYield;
+    }
+
+    uint256 public constant BPS_DENOMINATOR = 10_000;
+    uint256 public constant AUTHOR_YIELD_BPS = 8_000;
+    uint256 public constant PLATFORM_YIELD_BPS = 2_000;
+    uint256 public constant POST_DURATION = 30 days;
+
+    IERC20 public immutable stakingToken;
+    IERC20 public immutable aToken;
+    IAavePool public immutable aavePool;
+
+    address public treasury;
+    uint256 public immutable minStake;
+
+    uint256 public nextPostId;
+    uint256 public totalPrincipal;
+    uint256 public totalPostShares;
+    uint256 public accountedUserAssets;
+    uint256 public accountedPlatformAssets;
+
+    mapping(uint256 => Post) private _posts;
+
+    event PostCreated(
+        uint256 indexed postId,
+        address indexed author,
+        Category indexed category,
         uint256 amount,
-        uint256 nonce,
-        uint256 deadline,
-        bytes memory signature
-    ) external {
-        require(amount > 0, "Amount must be > 0");
-        require(block.timestamp <= deadline, "Signature expired");
+        uint256 shares,
+        uint256 expiresAt,
+        string metadataURI
+    );
+    event StakeAdded(uint256 indexed postId, address indexed author, uint256 amount, uint256 shares);
+    event PostHidden(uint256 indexed postId);
+    event PostClosed(
+        uint256 indexed postId,
+        address indexed author,
+        PostStatus indexed finalStatus,
+        uint256 principalReturned,
+        uint256 authorYield
+    );
+    event PlatformYieldClaimed(address indexed treasury, uint256 amount);
+    event TreasuryUpdated(address indexed previousTreasury, address indexed newTreasury);
+    event YieldSynced(uint256 userYield, uint256 platformYield);
 
-        bytes32 messageHash = keccak256(
-            abi.encodePacked(
-                chain_identifier,
-                "withdraw",
-                msg.sender,
-                amount,
-                nonce,
-                deadline,
-                address(this),
-                block.chainid
-            )
-        );
-        bytes32 ethSignedMessageHash = keccak256(
-            abi.encodePacked("\x19Ethereum Signed Message:\n32", messageHash)
-        );
-        require(
-            usedWithdrawAuthorizations[ethSignedMessageHash] == false,
-            "Authorization already used"
-        );
+    constructor(
+        address initialOwner,
+        address treasury_,
+        address stakingToken_,
+        address aToken_,
+        address aavePool_,
+        uint256 minStake_
+    ) Ownable(initialOwner) {
+        require(treasury_ != address(0), "Treasury is zero");
+        require(stakingToken_ != address(0), "Token is zero");
+        require(aToken_ != address(0), "aToken is zero");
+        require(aavePool_ != address(0), "Pool is zero");
+        require(minStake_ > 0, "Min stake is zero");
 
-        address recoveredSigner = _recoverSigner(ethSignedMessageHash, signature);
-        require(recoveredSigner == witness, "Invalid signature detected");
-        usedWithdrawAuthorizations[ethSignedMessageHash] = true;
+        treasury = treasury_;
+        stakingToken = IERC20(stakingToken_);
+        aToken = IERC20(aToken_);
+        aavePool = IAavePool(aavePool_);
+        minStake = minStake_;
 
-        _withdraw(msg.sender, amount);
-        emit InboxWithdraw(msg.sender, amount);
+        IERC20(stakingToken_).forceApprove(aavePool_, type(uint256).max);
     }
 
-    // can be called by operator for gasless users
-    function withdrawByOperator(address user, uint256 amount) external {
-        require(msg.sender == operator, "Only operator");
-        require(user != address(0), "Invalid user");
-        require(amount > 0, "Amount must be > 0");
-        _withdraw(user, amount);
+    function createPost(
+        Category category,
+        string calldata metadataURI,
+        uint256 amount
+    ) external nonReentrant returns (uint256 postId) {
+        require(bytes(metadataURI).length > 0, "Metadata is empty");
+        require(amount >= minStake, "Stake below minimum");
 
-        emit InboxWithdrawByOperator(msg.sender, user, amount);
-    }
+        _syncYield();
 
-    // can be called by sender only
-    function sendFund(uint256 amount) external {
-        require(amount > 0, "Amount must be > 0");
-        // require(amount <= inboxBalances[msg.sender], "Insufficient balance");
-        if (amount > inboxBalances[msg.sender]) {
-            uint256 remain = amount - inboxBalances[msg.sender];
-            inboxBalances[msg.sender] = 0;
+        postId = ++nextPostId;
+        uint256 shares = _mintShares(amount);
 
-            require(
-                IERC20(erc20).transferFrom(msg.sender, address(this), remain),
-                "Deposit failed"
-            );
-
-            IERC20(erc20).approve(aave, remain);
-            IAave(aave).supply(erc20, remain, address(this), 0);
-
-            total += remain;
-        } else {
-            inboxBalances[msg.sender] -= amount;
-        }
-
-        transfer_count += 1;
-        uint256 txNo = transfer_count;
-        inboxTransfers[txNo] = Transfer({
-            fromAddr: msg.sender,
-            toAddr: address(0),
-            amount: amount,
-            finished: false
+        _posts[postId] = Post({
+            author: msg.sender,
+            category: category,
+            status: PostStatus.Active,
+            principal: amount,
+            shares: shares,
+            createdAt: uint64(block.timestamp),
+            expiresAt: uint64(block.timestamp + POST_DURATION),
+            metadataURI: metadataURI
         });
 
-        emit InboxSend(txNo);
-    }
+        totalPrincipal += amount;
 
-    // can be called by receiver only, with witness signature
-    function acceptFundByUser(
-        uint256 txNo,
-        address toAddr,
-        uint256 convertAmount,
-        bytes memory signature
-    ) external {
-        require(toAddr != address(0), "Invalid recipient address");
-        require(msg.sender == toAddr, "Invalid sender address");
+        stakingToken.safeTransferFrom(msg.sender, address(this), amount);
+        _depositToAave(amount);
 
-        bytes32 messageHash = keccak256(
-            abi.encodePacked(
-                chain_identifier,
-                msg.sender,
-                txNo,
-                toAddr,
-                convertAmount
-            )
+        emit PostCreated(
+            postId,
+            msg.sender,
+            category,
+            amount,
+            shares,
+            block.timestamp + POST_DURATION,
+            metadataURI
         );
-        bytes32 ethSignedMessageHash = keccak256(
-            abi.encodePacked("\x19Ethereum Signed Message:\n32", messageHash)
+    }
+
+    function addStake(uint256 postId, uint256 amount) external nonReentrant {
+        require(amount > 0, "Amount is zero");
+
+        Post storage post = _posts[postId];
+        require(post.author != address(0), "Post not found");
+        require(post.author == msg.sender, "Not author");
+        require(post.status == PostStatus.Active, "Post not active");
+        require(block.timestamp < post.expiresAt, "Post expired");
+
+        _syncYield();
+
+        uint256 shares = _mintShares(amount);
+
+        post.principal += amount;
+        post.shares += shares;
+        totalPrincipal += amount;
+
+        stakingToken.safeTransferFrom(msg.sender, address(this), amount);
+        _depositToAave(amount);
+
+        emit StakeAdded(postId, msg.sender, amount, shares);
+    }
+
+    function hidePost(uint256 postId) external onlyOwner {
+        Post storage post = _posts[postId];
+        require(post.author != address(0), "Post not found");
+        require(post.status == PostStatus.Active, "Post not active");
+
+        post.status = PostStatus.Hidden;
+        emit PostHidden(postId);
+    }
+
+    function closePostAndWithdraw(uint256 postId) external nonReentrant returns (uint256 payout) {
+        Post storage post = _posts[postId];
+        require(post.author != address(0), "Post not found");
+        require(post.author == msg.sender, "Not author");
+        require(
+            post.status == PostStatus.Active || post.status == PostStatus.Hidden,
+            "Post already settled"
         );
 
-        address recoveredSigner = _recoverSigner(ethSignedMessageHash, signature);
-        require(recoveredSigner == witness, "Invalid signature detected");
-
-        _acceptFund(txNo, toAddr, convertAmount);
+        _syncYield();
+        payout = _settlePost(postId, msg.sender, block.timestamp >= post.expiresAt);
     }
 
-    // can be called by operator only, no witness signature needed
-    function acceptFundByOperator(
-        uint256 txNo,
-        address toAddr,
-        uint256 convertAmount
-    ) external {
-        require(msg.sender == operator, "Only operator");
-        require(toAddr != address(0), "Invalid recipient address");
-        _acceptFund(txNo, toAddr, convertAmount);
+    function expirePost(uint256 postId) external nonReentrant returns (uint256 payout) {
+        Post storage post = _posts[postId];
+        require(post.author != address(0), "Post not found");
+        require(
+            post.status == PostStatus.Active || post.status == PostStatus.Hidden,
+            "Post already settled"
+        );
+        require(block.timestamp >= post.expiresAt, "Post still active");
+
+        _syncYield();
+        payout = _settlePost(postId, post.author, true);
     }
 
-    // can be called by the sender only
-    function revokeFund(uint256 txNo) external {
-        require(inboxTransfers[txNo].fromAddr != address(0), "Invalid txNo");
-        require(inboxTransfers[txNo].fromAddr == msg.sender, "Invalid sender");
-        require(inboxTransfers[txNo].finished == false, "Invalid transfer");
+    function claimPlatformYield(uint256 amount) external onlyOwner nonReentrant {
+        require(amount > 0, "Amount is zero");
 
-        inboxBalances[msg.sender] += inboxTransfers[txNo].amount;
-        // inboxTransfers[txNo].amount = 0;
-        inboxTransfers[txNo].finished = true;
+        _syncYield();
+        require(amount <= accountedPlatformAssets, "Amount exceeds platform yield");
 
-        emit InboxRevoke(txNo);
+        accountedPlatformAssets -= amount;
+        _pullLiquidity(amount);
+        stakingToken.safeTransfer(treasury, amount);
+
+        emit PlatformYieldClaimed(treasury, amount);
     }
 
-    function _withdraw(address user, uint256 amount) internal {
-        require(inboxBalances[user] >= amount, "Insufficient balance");
-        inboxBalances[user] -= amount;
-        total -= amount;
-
-        IAave(aave).withdraw(erc20, amount, address(this));
-        require(IERC20(erc20).transfer(user, amount), "Withdraw failed");
+    function setTreasury(address newTreasury) external onlyOwner {
+        require(newTreasury != address(0), "Treasury is zero");
+        emit TreasuryUpdated(treasury, newTreasury);
+        treasury = newTreasury;
     }
 
-    function _acceptFund(
-        uint256 txNo,
-        address toAddr,
-        uint256 convertAmount
-    ) internal {
-        Transfer memory transfer = inboxTransfers[txNo];
-        require(transfer.fromAddr != address(0), "Invalid txNo");
-        require(transfer.finished == false, "Transfer already finished");
-
-        inboxBalances[toAddr] += transfer.amount;
-        inboxTransfers[txNo].finished = true;
-        inboxTransfers[txNo].toAddr = toAddr;
-
-        emit InboxAccept(txNo, convertAmount);
+    function managedAssets() public view returns (uint256) {
+        return stakingToken.balanceOf(address(this)) + aToken.balanceOf(address(this));
     }
 
-    // ============ Utility Functions ============
-    function _recoverSigner(
-        bytes32 ethSignedMessageHash,
-        bytes memory signature
-    ) internal pure returns (address) {
-        require(signature.length == 65, "Invalid signature length");
+    function previewPlatformClaimable() external view returns (uint256) {
+        AccountingPreview memory preview = _previewAccounting();
+        return preview.platformAssets;
+    }
 
-        bytes32 r;
-        bytes32 s;
-        uint8 v;
+    function getPost(uint256 postId) external view returns (Post memory) {
+        Post memory post = _posts[postId];
+        require(post.author != address(0), "Post not found");
+        return post;
+    }
 
-        assembly {
-            r := mload(add(signature, 32))
-            s := mload(add(signature, 64))
-            v := byte(0, mload(add(signature, 96)))
+    function previewPostPayout(uint256 postId) external view returns (uint256 totalPayout, uint256 authorYield) {
+        Post storage post = _posts[postId];
+        require(post.author != address(0), "Post not found");
+
+        AccountingPreview memory preview = _previewAccounting();
+        totalPayout = _previewPostValue(post, preview.userAssets);
+        authorYield = totalPayout > post.principal ? totalPayout - post.principal : 0;
+    }
+
+    function isExpired(uint256 postId) external view returns (bool) {
+        Post storage post = _posts[postId];
+        require(post.author != address(0), "Post not found");
+        return block.timestamp >= post.expiresAt;
+    }
+
+    function syncYield() external {
+        _syncYield();
+    }
+
+    function _settlePost(
+        uint256 postId,
+        address recipient,
+        bool expired
+    ) internal returns (uint256 payout) {
+        Post storage post = _posts[postId];
+
+        payout = _previewPostValue(post, accountedUserAssets);
+        uint256 principalReturned = post.principal;
+        uint256 authorYield = payout > principalReturned ? payout - principalReturned : 0;
+
+        accountedUserAssets -= payout;
+        totalPostShares -= post.shares;
+        totalPrincipal -= principalReturned;
+
+        post.principal = 0;
+        post.shares = 0;
+        post.status = expired ? PostStatus.Expired : PostStatus.Closed;
+
+        _pullLiquidity(payout);
+        stakingToken.safeTransfer(recipient, payout);
+
+        emit PostClosed(postId, recipient, post.status, principalReturned, authorYield);
+    }
+
+    function _previewAccounting() internal view returns (AccountingPreview memory preview) {
+        preview.userAssets = accountedUserAssets;
+        preview.platformAssets = accountedPlatformAssets;
+
+        uint256 managed = managedAssets();
+        uint256 accountedTotal = preview.userAssets + preview.platformAssets;
+
+        if (managed <= accountedTotal) {
+            return preview;
         }
 
-        // Adjust v if necessary
-        if (v < 27) {
-            v += 27;
+        uint256 freshYield = managed - accountedTotal;
+
+        if (accountedTotal == 0) {
+            preview.platformAssets += freshYield;
+            preview.platformYield = freshYield;
+            return preview;
         }
 
-        require(v == 27 || v == 28, "Invalid signature v value");
+        uint256 yieldFromUserCapital;
+        uint256 yieldFromPlatformCapital;
 
-        return ecrecover(ethSignedMessageHash, v, r, s);
+        if (preview.platformAssets == 0) {
+            yieldFromUserCapital = freshYield;
+        } else if (preview.userAssets == 0) {
+            yieldFromPlatformCapital = freshYield;
+        } else {
+            yieldFromUserCapital = (freshYield * preview.userAssets) / accountedTotal;
+            yieldFromPlatformCapital = freshYield - yieldFromUserCapital;
+        }
+
+        uint256 userYieldShare = (yieldFromUserCapital * AUTHOR_YIELD_BPS) / BPS_DENOMINATOR;
+        uint256 platformYieldShare = freshYield - userYieldShare;
+
+        preview.userAssets += userYieldShare;
+        preview.platformAssets += platformYieldShare;
+        preview.userYield = userYieldShare;
+        preview.platformYield = platformYieldShare;
+    }
+
+    function _syncYield() internal {
+        AccountingPreview memory preview = _previewAccounting();
+
+        if (
+            preview.userAssets == accountedUserAssets &&
+            preview.platformAssets == accountedPlatformAssets
+        ) {
+            return;
+        }
+
+        accountedUserAssets = preview.userAssets;
+        accountedPlatformAssets = preview.platformAssets;
+
+        emit YieldSynced(preview.userYield, preview.platformYield);
+    }
+
+    function _mintShares(uint256 amount) internal returns (uint256 shares) {
+        if (totalPostShares == 0 || accountedUserAssets == 0) {
+            shares = amount;
+        } else {
+            shares = (amount * totalPostShares) / accountedUserAssets;
+        }
+
+        require(shares > 0, "Shares round to zero");
+
+        totalPostShares += shares;
+        accountedUserAssets += amount;
+    }
+
+    function _previewPostValue(Post storage post, uint256 userAssets) internal view returns (uint256) {
+        if (post.shares == 0 || totalPostShares == 0) {
+            return 0;
+        }
+
+        if (post.shares == totalPostShares) {
+            return userAssets;
+        }
+
+        return (post.shares * userAssets) / totalPostShares;
+    }
+
+    function _depositToAave(uint256 amount) internal {
+        if (amount == 0) {
+            return;
+        }
+
+        aavePool.supply(address(stakingToken), amount, address(this), 0);
+    }
+
+    function _pullLiquidity(uint256 amount) internal {
+        if (amount == 0) {
+            return;
+        }
+
+        uint256 liquidBalance = stakingToken.balanceOf(address(this));
+        if (liquidBalance >= amount) {
+            return;
+        }
+
+        aavePool.withdraw(address(stakingToken), amount - liquidBalance, address(this));
     }
 }
